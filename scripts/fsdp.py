@@ -28,6 +28,12 @@ class ModelConfig(NamedTuple):
     swiglu_limit: float = 7.0
 
 
+fsdp_remat = functools.partial(  # Don't save reshard (all-gathered weights)
+    jax.remat,
+    policy=jax.checkpoint_policies.save_anything_except_these_names("reshard"),
+)
+
+
 class MLP(eqx.Module):
     """
     Interleaved swiglu with TP + FSDP
@@ -55,19 +61,16 @@ class MLP(eqx.Module):
         )
         return x_glu * (x_lin + 1)
 
-    @functools.partial(
-        jax.remat,  # Don't save reshard (all-gathered weights)
-        policy=jax.checkpoint_policies.save_anything_except_these_names("reshard"),
-    )
+    @fsdp_remat
     def __call__(self, x):
         # all-gather fsdp weights before compute
         w13 = reshard(self.w13, P("model", None))
         w2 = reshard(self.w2, P(None, "model"))
         # column-parallel, partial sum
-        x = jnp.matmul(x, w13.T, out_sharding=P("batch", "model")) + self.b13
+        x = jnp.matmul(x, w13.T, out_sharding=P(None, "model")) + self.b13
         x = self.swiglu(x)
         # row-parallel: all-reduce over model
-        x = jnp.matmul(x, w2.T, out_sharding=P("batch", None)) + self.b2
+        x = jnp.matmul(x, w2.T, out_sharding=P(None, None)) + self.b2
         return x
 
 
@@ -90,11 +93,12 @@ class Model(eqx.Module):
         )
         self.b_out = jax.random.normal(bkey, (self.config.d_model,)) * 0.05
 
+    @fsdp_remat
     def __call__(self, x):
         for layer in self.layers:
             x = layer(x)
         w_out = reshard(self.w_out, P("model", None))
-        x = jnp.matmul(x, w_out.T, out_sharding=P("batch", None)) + self.b_out
+        x = jnp.matmul(x, w_out.T, out_sharding=P(None, None)) + self.b_out
         return x
 
 
@@ -123,10 +127,10 @@ def shard(tree):
 key, model_key, act_key = jax.random.split(key, 3)
 config = ModelConfig(n_layers=5, d_model=32, d_intermediate=64)
 model = Model(model_key, config)
-x = jax.random.normal(act_key, (16, 32))
-x = jax.device_put(x, P("batch", None))
+x = jax.random.normal(act_key, (16, 512, 32))
+x = jax.device_put(x, P("batch", None, None))
 
-out = model(x)
+out = jax.vmap(model)(x)
 assert not jnp.isnan(out).any()
 
 print("\n---")
@@ -135,7 +139,7 @@ print("before", jax.typeof(model.layers[0].w13))
 model = shard(model)
 print("after", jax.typeof(model.layers[0].w13))
 
-out_shard = model(x)
+out_shard = jax.vmap(model)(x)
 assert not jnp.isnan(out_shard).any()
 assert jnp.allclose(out, out_shard, rtol=1e-5, atol=1e-5)
 
@@ -143,17 +147,21 @@ assert jnp.allclose(out, out_shard, rtol=1e-5, atol=1e-5)
 
 
 @eqx.filter_jit
-def loss(model, x):
-    logits = model(x)
-    return jnp.mean(jnp.sum(logits, axis=-1))
+def train_step(model, x):
+    def loss_fn(model, x):
+        logits = jax.vmap(model)(x)
+        return jnp.mean(jnp.sum(logits, axis=-1))  # dummy
 
+    def adam_update(param, grad, mu, nu):
+        mu[...] = ()
 
-eqx.filter_grad(loss)(model, x)
+    loss, grad = eqx.filter_value_and_grad(loss_fn)(model, x)
+
 
 # %%
 
 
-class Adam(NamedTuple):
+class AdamState(NamedTuple):
     mu: Model
     nu: Model
     step: int
