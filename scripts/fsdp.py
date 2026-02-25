@@ -154,8 +154,8 @@ eqx.filter_grad(loss)(model, x)
 
 
 class Adam(NamedTuple):
-    mu: list
-    nu: list
+    mu: Model
+    nu: Model
     step: int
 
 
