@@ -13,7 +13,7 @@ import equinox as eqx
 
 mesh = jax.make_mesh(
     (2, 4, 4),
-    ("batch", "fsdp", "model"),
+    ("data", "fsdp", "model"),
     (AxisType.Explicit, AxisType.Explicit, AxisType.Explicit),
 )
 jax.set_mesh(mesh)
@@ -89,6 +89,8 @@ class MLPBlock(eqx.Module):
         # all-gather fsdp weights before compute
         w13 = reshard(self.w13, P("model", None))
         w2 = reshard(self.w2, P(None, "model"))
+        # sanity check: sharded on seq
+        jax.lax.with_sharding_constraint(x, P("model", None))
         # column-parallel, partial sum
         x = jnp.matmul(x, w13.T, out_sharding=P(None, "model")) + self.b13
         x = self.swiglu(x)
@@ -108,7 +110,12 @@ class AttentionBlock(eqx.Module):
     def __init__(self, key, config: ModelConfig):
         self.config = config
         keys = jax.random.split(key, 5)
-        nq, nkv, hd, D = config.num_attention_heads, config.num_kv_heads, config.head_dim, config.hidden_dim
+        nq, nkv, hd, D = (
+            config.num_attention_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.hidden_dim,
+        )
         self.w_q = jax.random.normal(keys[0], (nq * hd, D)) * 0.05
         self.w_k = jax.random.normal(keys[1], (nkv * hd, D)) * 0.05
         self.w_v = jax.random.normal(keys[2], (nkv * hd, D)) * 0.05
@@ -117,7 +124,11 @@ class AttentionBlock(eqx.Module):
 
     @fsdp_remat
     def __call__(self, x):
-        nq, nkv, hd = self.config.num_attention_heads, self.config.num_kv_heads, self.config.head_dim
+        nq, nkv, hd = (
+            self.config.num_attention_heads,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+        )
 
         # all-gather fsdp, keep heads on model
         w_q = reshard(self.w_q, P("model", None))
@@ -181,21 +192,20 @@ class Model(eqx.Module):
 
     @fsdp_remat
     def __call__(self, tokens):
-        # parallel embedding: all-gather fsdp, gather from model-sharded vocab, all-reduce
         w_embed = reshard(self.w_embed, P("model", None))
+        w_unembed = reshard(self.w_unembed, P(None, "model"))
         # tokens[seq] -> x[seq@model, d_model] -> x[seq, d_model] (all-reduce)
         x = w_embed.at[tokens].get(out_sharding=P(None, None))
         for layer in self.layers:
             x = layer(x)
-        w_unembed = reshard(self.w_unembed, P(None, "model"))
-        x = jnp.matmul(x, w_unembed.T, out_sharding=P(None, None))
+        x = jnp.matmul(x, w_unembed.T, out_sharding=P("model", None))
         return x
 
 
 def shard(tree):
     def shard_param(key, param):
         if param is None:
-            return
+            return None
         param_name = key[-1].name
         if param_name in {"w13", "w_q", "w_k", "w_v"}:
             # column-parallel: (out_features@model, in_features@fsdp)
@@ -225,8 +235,8 @@ k1, k2 = jax.random.split(data_key)
 batch_size, seq_len = 16, 32
 tokens = jax.random.randint(k1, (batch_size, seq_len), 0, config.vocab_size)
 # simple learned-ish embedding: just random vectors per token (dummy)
-x = jax.device_put(tokens, P("batch", None))
-tokens = jax.device_put(tokens, P("batch", None))
+x = jax.device_put(tokens, P("data", None))
+tokens = jax.device_put(tokens, P("data", None))
 
 
 out = jax.vmap(model)(x)
@@ -262,16 +272,6 @@ train_step(model, x, tokens)
 
 # %%
 
-# After shard(), lower and inspect:
-lowered = jax.jit(jax.vmap(model)).lower(x)
-hlo = lowered.as_text()
-
-# %%
-
-jaxpr = jax.make_jaxpr(jax.jit(jax.vmap(model)))(x)
-
-# %%
-
 
 class AdamState(NamedTuple):
     mu: Model
@@ -287,7 +287,6 @@ def init_optimizer(model):
 
 
 optim = init_optimizer(model)
-
 optim = shard(optim)
 
 # # %%
