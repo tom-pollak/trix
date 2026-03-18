@@ -1,3 +1,17 @@
+"""
+Each shard has its own seperate roll parameter, and performs a roll on its own local
+slice. No communication required between the devices.
+
+This is a rather arbitary problem obviously, doing it in a few different ways:
+
+1. Simple jax.jit
+2. Pallas loading from HBM
+3. Handrolled pipelining pallas kernel.
+4. SparseCore gather/scatter
+
+1,2,3 all match perf, 4 is noticeably slower (since it is a contiguous DMA block, not
+suited to SC).
+"""
 from functools import partial
 import jax
 import jax.numpy as jnp
