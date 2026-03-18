@@ -12,6 +12,7 @@ This is a rather arbitary problem obviously, doing it in a few different ways:
 1,2,3 all match perf, 4 is noticeably slower (since it is a contiguous DMA block, not
 suited to SC).
 """
+
 from functools import partial
 import jax
 import jax.numpy as jnp
@@ -107,7 +108,6 @@ def roll_shard_simple(A_s, shift):  # ...ish
                 rsem,
             ).wait()
 
-            # Extract correct BM rows — all slices are static Python ints
             for r in range(8):
 
                 @pl.when(s_rem == r)
@@ -136,7 +136,7 @@ roll_shard_simple(A, shifts)
     check_vma=False,
 )
 @chex.assert_max_traces(n=1)
-def roll_shard_pipelined(A_s, shift, BM=2048, pipeline_len=2): # also multi-core
+def roll_shard_pipelined(A_s, shift, BM=2048, pipeline_len=2):  # also multi-core
     M, N = A_s.shape
     num_blocks = pl.cdiv(M, BM)
     A_tiled = jnp.concatenate([A_s, A_s], axis=0)
@@ -227,7 +227,7 @@ roll_shard_pipelined(A, shifts)
     check_vma=False,
 )
 @chex.assert_max_traces(n=1)
-def roll_shard_sparsecore(A_s, shift): # slower since roll is a nice big DMA load/store
+def roll_shard_sparsecore(A_s, shift):  # slower since roll is a nice big DMA load/store
     M, N = A_s.shape
     gather_window = 256
 
