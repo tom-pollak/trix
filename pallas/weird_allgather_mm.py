@@ -19,7 +19,6 @@ import os
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 from functools import partial
-import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.experimental.pallas as pl
@@ -177,13 +176,11 @@ def all_gather_matmul(x_s, y):
 x = jax.random.uniform(jax.random.key(0), (2048, 2048), dtype=jnp.bfloat16)
 y = jax.random.uniform(jax.random.key(1), (2048, 2048), dtype=jnp.bfloat16)
 
-z_ref = x @ y
-
 x = jax.device_put(x, jax.P(None, "x"))
 y = jax.device_put(y, jax.P(None, "x"))
 
 z = all_gather_matmul(x, y)
-
+z_ref = x @ y
 assert jnp.allclose(z, z_ref)
 
 # %%
