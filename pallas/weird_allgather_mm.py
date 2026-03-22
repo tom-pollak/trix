@@ -25,9 +25,8 @@ import jax.numpy as jnp
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 
-INTERPRET = jax.default_backend() == "cpu"
-if INTERPRET:
-    INTERPRET = True
+if jax.default_backend() == "cpu":
+    pltpu.set_tpu_interpret_mode(pltpu.InterpretParams(num_cores_or_threads=2))
 
 mesh = jax.make_mesh((8,), ("x",), (jax.sharding.AxisType.Explicit,))
 jax.set_mesh(mesh)
@@ -37,7 +36,7 @@ jax.set_mesh(mesh)
 
 
 def matmul(x_ref, y_ref, z_ref, acc_vmem, block_shape, write_z: bool, zero_acc: bool):
-    def matmul_kernel(x_vmem, y_vmem, z_vmem, acc_vmem):
+    def matmul_kernel(x_vmem, y_vmem, z_vmem):
         @pl.when(zero_acc & (pl.program_id(2) == 0))
         def _():
             acc_vmem[...] = jnp.zeros_like(acc_vmem)
@@ -66,12 +65,11 @@ def matmul(x_ref, y_ref, z_ref, acc_vmem, block_shape, write_z: bool, zero_acc: 
         grid=grid,
         in_specs=[x_spec, y_spec],
         out_specs=[z_spec],
-        should_accumulate_out=True,
         dimension_semantics=(pltpu.PARALLEL, pltpu.PARALLEL, pltpu.ARBITRARY),
     )(x_ref, y_ref, z_ref)
 
 
-BLOCK_SHAPE = (16, 16, 16)
+BLOCK_SHAPE = (256, 256, 256)
 
 
 @jax.jit
@@ -99,7 +97,6 @@ def all_gather_matmul(x_s, y):
             local_sems=pltpu.SemaphoreType.DMA((2,)),
         ),
         compiler_params=pltpu.CompilerParams(collective_id=0),
-        interpret=INTERPRET,
     )
     def kernel(z_hbm, acc_vmem, local_sems):
         left_idx = (device_idx - 1) % axis_size
@@ -108,7 +105,10 @@ def all_gather_matmul(x_s, y):
         fut_left = pltpu.async_copy(x_hbm, xp_left_hbm, local_sems.at[0])
         fut_right = pltpu.async_copy(x_hbm, xp_right_hbm, local_sems.at[1])
 
-        matmul(x_hbm, y_hbm, z_hbm, acc_vmem, BLOCK_SHAPE, write_z=False, zero_acc=True)
+        write_z = axis_size == 1
+        matmul(
+            x_hbm, y_hbm, z_hbm, acc_vmem, BLOCK_SHAPE, write_z=write_z, zero_acc=True
+        )
 
         # Sync all devices
         sem_barrier = pltpu.get_barrier_semaphore()
@@ -123,7 +123,6 @@ def all_gather_matmul(x_s, y):
             pl.run_scoped,
             send_sems=pltpu.SemaphoreType.DMA((axis_size - 1,)),
             recv_sems=pltpu.SemaphoreType.DMA((axis_size - 1,)),
-            collective_axes="x",
         )
         def gather(send_sems, recv_sems):
             def bi_send(i):
@@ -171,13 +170,20 @@ def all_gather_matmul(x_s, y):
 
                 fut_left.wait_send()
                 fut_right.wait_send()
+
     return kernel()
 
 
-x = np.arange(2048).reshape(32, 64)
-y = np.arange(2048).reshape(32, 64)
+x = jax.random.uniform(jax.random.key(0), (2048, 2048), dtype=jnp.bfloat16)
+y = jax.random.uniform(jax.random.key(1), (2048, 2048), dtype=jnp.bfloat16)
+
+z_ref = x @ y
+
 x = jax.device_put(x, jax.P(None, "x"))
 y = jax.device_put(y, jax.P(None, "x"))
-all_gather_matmul(x, y)
+
+z = all_gather_matmul(x, y)
+
+assert jnp.allclose(z, z_ref)
 
 # %%
