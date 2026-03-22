@@ -62,7 +62,7 @@ def matmul(x_ref, y_ref, z_ref, acc_vmem, block_shape, write_z: bool, zero_acc: 
 
     # pltpu.VMEM((bm, bn), dtype=jnp.float32)
     pltpu.emit_pipeline(
-        matmul,
+        matmul_kernel,
         grid=grid,
         in_specs=[x_spec, y_spec],
         out_specs=[z_spec],
@@ -71,17 +71,19 @@ def matmul(x_ref, y_ref, z_ref, acc_vmem, block_shape, write_z: bool, zero_acc: 
     )(x_ref, y_ref, z_ref)
 
 
-@jax.jit(static_argnames=["block_shape"])
-@jax.shard_map(mesh=mesh, out_specs=jax.P(None, "x"))
-def all_gather_matmul(x_s, y, block_shape, check_vma=False):
+BLOCK_SHAPE = (16, 16, 16)
+
+
+@jax.jit
+@jax.shard_map(mesh=mesh, out_specs=jax.P(None, "x"), check_vma=False)
+def all_gather_matmul(x_s, y):
+    bm, bk, bn = BLOCK_SHAPE
     m, k_s = x_s.shape
     k, n = y.shape
-    bm, bk, bn = block_shape
     z = jnp.empty((m, n), dtype=x_s.dtype)
 
     x_hbm = jax.new_ref(x_s)
     y_hbm = jax.new_ref(y)
-    z_hbm = jax.new_ref(z)
 
     # blocks of x
     xp_left_hbm = jax.new_ref(jnp.empty_like(x_s))
@@ -91,20 +93,22 @@ def all_gather_matmul(x_s, y, block_shape, check_vma=False):
 
     @pl.kernel(
         mesh=pltpu.create_tensorcore_mesh("core", num_cores=2),
+        out_shape=jax.ShapeDtypeStruct(z.shape, z.dtype),
         scratch_shapes=dict(
             acc_vmem=pltpu.VMEM((bm, bn), dtype=jnp.float32),
             local_sems=pltpu.SemaphoreType.DMA((2,)),
         ),
+        compiler_params=pltpu.CompilerParams(collective_id=0),
         interpret=INTERPRET,
     )
-    def _(acc_vmem, local_sems):
+    def kernel(z_hbm, acc_vmem, local_sems):
         left_idx = (device_idx - 1) % axis_size
         right_idx = (device_idx + 1) % axis_size
 
         fut_left = pltpu.async_copy(x_hbm, xp_left_hbm, local_sems.at[0])
         fut_right = pltpu.async_copy(x_hbm, xp_right_hbm, local_sems.at[1])
 
-        matmul(x_hbm, y_hbm, z_hbm, acc_vmem, block_shape, write_z=False, zero_acc=True)
+        matmul(x_hbm, y_hbm, z_hbm, acc_vmem, BLOCK_SHAPE, write_z=False, zero_acc=True)
 
         # Sync all devices
         sem_barrier = pltpu.get_barrier_semaphore()
@@ -128,14 +132,14 @@ def all_gather_matmul(x_s, y, block_shape, check_vma=False):
                     xp_left_hbm,
                     send_sem=send_sems.at[i],
                     recv_sem=recv_sems.at[i],
-                    device_id={"x", left_idx},
+                    device_id={"x": left_idx},
                 )
                 fut_right = pltpu.async_remote_copy(
                     xp_right_hbm,
                     xp_right_hbm,
                     send_sem=send_sems.at[i + 1],
                     recv_sem=recv_sems.at[i + 1],
-                    device_id={"x", right_idx},
+                    device_id={"x": right_idx},
                 )
                 return fut_left, fut_right
 
@@ -143,14 +147,13 @@ def all_gather_matmul(x_s, y, block_shape, check_vma=False):
                 write_z = i == axis_size - 2
                 fut_left, fut_right = bi_send(i)
 
-                # TODO: done in parallel?
                 fut_left.wait_recv()
                 matmul(
                     xp_left_hbm,
                     y_hbm,
                     z_hbm,
                     acc_vmem,
-                    block_shape,
+                    BLOCK_SHAPE,
                     write_z=write_z,
                     zero_acc=False,
                 )
@@ -161,20 +164,20 @@ def all_gather_matmul(x_s, y, block_shape, check_vma=False):
                     y_hbm,
                     z_hbm,
                     acc_vmem,
-                    block_shape,
+                    BLOCK_SHAPE,
                     write_z=write_z,
                     zero_acc=False,
                 )
 
                 fut_left.wait_send()
                 fut_right.wait_send()
+    return kernel()
 
 
-block_shape = (16, 16, 16)
 x = np.arange(2048).reshape(32, 64)
 y = np.arange(2048).reshape(32, 64)
 x = jax.device_put(x, jax.P(None, "x"))
 y = jax.device_put(y, jax.P(None, "x"))
-all_gather_matmul(x, y, block_shape)
+all_gather_matmul(x, y)
 
 # %%
