@@ -109,9 +109,15 @@ def all_gather_matmul(x_s, y):
         fut_left = pltpu.async_copy(x_hbm, xp_left_hbm, local_sems.at[0])
         fut_right = pltpu.async_copy(x_hbm, xp_right_hbm, local_sems.at[1])
 
-        write_z = axis_size == 1
+        final = axis_size == 1
         matmul(
-            x_hbm, y_hbm, z_hbm, acc_vmem, BLOCK_SHAPE, write_z=write_z, zero_acc=True
+            x_hbm,
+            y_hbm,
+            z_hbm,
+            acc_vmem,
+            BLOCK_SHAPE,
+            write_z=final,
+            zero_acc=True,
         )
 
         # Sync all devices
@@ -123,7 +129,7 @@ def all_gather_matmul(x_s, y):
         fut_left.wait()
         fut_right.wait()
 
-        def bi_send(i):
+        def bi_send(i, final: bool):
             fut_left = pltpu.async_remote_copy(
                 xp_left_hbm,
                 xp_left_hbm,
@@ -131,18 +137,23 @@ def all_gather_matmul(x_s, y):
                 recv_sem=recv_sems.at[i],
                 device_id={"x": left_idx},
             )
-            fut_right = pltpu.async_remote_copy(
-                xp_right_hbm,
-                xp_right_hbm,
-                send_sem=send_sems.at[i + 1],
-                recv_sem=recv_sems.at[i + 1],
-                device_id={"x": right_idx},
-            )
+            if not final:
+                fut_right = pltpu.async_remote_copy(
+                    xp_right_hbm,
+                    xp_right_hbm,
+                    send_sem=send_sems.at[i + 1],
+                    recv_sem=recv_sems.at[i + 1],
+                    device_id={"x": right_idx},
+                )
+            else:
+                fut_right = None
             return fut_left, fut_right
 
         for i in range(0, (axis_size - 1), 2):
-            write_z = i == axis_size - 2
-            fut_left, fut_right = bi_send(i)
+            # First iter done outside for loop, so we have axis_size - 1 work to do
+            # since axis_size is always even, the write will come round in an odd iter
+            final = i == axis_size - 2
+            fut_left, fut_right = bi_send(i, final=final)
 
             fut_left.wait_recv()
             matmul(
@@ -151,23 +162,24 @@ def all_gather_matmul(x_s, y):
                 z_hbm,
                 acc_vmem,
                 BLOCK_SHAPE,
-                write_z=write_z,
+                write_z=final,
                 zero_acc=False,
             )
 
-            fut_right.wait_recv()
-            matmul(
-                xp_right_hbm,
-                y_hbm,
-                z_hbm,
-                acc_vmem,
-                BLOCK_SHAPE,
-                write_z=write_z,
-                zero_acc=False,
-            )
+            if not final:
+                fut_right.wait_recv()
+                matmul(
+                    xp_right_hbm,
+                    y_hbm,
+                    z_hbm,
+                    acc_vmem,
+                    BLOCK_SHAPE,
+                    write_z=False,
+                    zero_acc=False,
+                )
+                fut_right.wait_send()
 
             fut_left.wait_send()
-            fut_right.wait_send()
 
     return kernel()
 
