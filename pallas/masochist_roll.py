@@ -229,7 +229,7 @@ roll_shard_pipelined(A, shifts)
 @chex.assert_max_traces(n=1)
 def roll_shard_sparsecore(A_s, shift):  # slower since roll is a nice big DMA load/store
     M, N = A_s.shape
-    gather_window = 256
+    gather_window = 128
     assert pltpu.get_tpu_info().sparse_core is not None, "tpu does not have sparse cores"
 
     indices = (jnp.arange(M, dtype=jnp.int32)[None, :] - shift) % M
