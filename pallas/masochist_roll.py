@@ -1,3 +1,4 @@
+# %%
 """
 Each shard has its own seperate roll parameter, and performs a roll on its own local
 slice. No communication required between the devices.
@@ -24,7 +25,7 @@ import chex
 # %%
 
 mesh = jax.make_mesh(
-    (1, 1),  # MOCK
+    (2, 2),  # MOCK
     ("X", "Y"),
     axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
 )
@@ -32,17 +33,14 @@ jax.set_mesh(mesh)
 
 # %%
 
-sc_info = pltpu.get_tpu_info().sparse_core
-sc_info
-
 # %%
 
-S, D = 16384, 128
+S, D = 16384, 512
 
 A = jnp.arange(S * D, dtype=jnp.bfloat16).reshape(S, D)
 A = jax.device_put(A, jax.P("X", "Y"))
 shifts = jax.random.randint(
-    jax.random.key(0), (jax.device_count(),), 0, S, dtype=jnp.int32
+    jax.random.key(0), (mesh.axis_sizes[0],), 0, S, dtype=jnp.int32
 )
 shifts = jax.device_put(shifts, jax.P("X"))
 
@@ -185,29 +183,31 @@ def roll_shard_pipelined(A_s, shift, BM=2048, pipeline_len=2):  # also multi-cor
             buf, sem = get_slot(out_buf_x2, i), get_slot(wsems, i)
             return pltpu.make_async_copy(buf, o_hbm.at[pl.ds(i * BM, BM), :], sem)
 
+        core_start = num_blocks_per_core * core_idx
+
         # prologue
         for i in range(pipeline_len):
-            get_read_desc(i).start()
+            get_read_desc(core_start + i).start()
 
         @pl.loop(0, num_blocks_per_core)
         def _(i):
-            i = i + num_blocks * core_idx
+            i = i + core_start
             get_read_desc(i).wait()
 
-            @pl.when(i - pipeline_len >= 0)  # wait previous copy
+            @pl.when(i - pipeline_len >= core_start)  # wait previous copy
             def _():
                 get_write_desc(i - pipeline_len).wait()
 
             shift_copy(i)
             get_write_desc(i).start()
 
-            @pl.when(i < num_blocks - pipeline_len)
+            @pl.when(i + pipeline_len < core_start + num_blocks_per_core)
             def _():
                 get_read_desc(i + pipeline_len).start()
 
         # epilogue
         for i in range(pipeline_len):
-            get_write_desc(num_blocks - pipeline_len + i).wait()
+            get_write_desc(core_start + num_blocks_per_core - pipeline_len + i).wait()
 
     return kernel(A_tiled, shift)
 
@@ -230,6 +230,7 @@ roll_shard_pipelined(A, shifts)
 def roll_shard_sparsecore(A_s, shift):  # slower since roll is a nice big DMA load/store
     M, N = A_s.shape
     gather_window = 256
+    assert pltpu.get_tpu_info().sparse_core is not None, "tpu does not have sparse cores"
 
     indices = (jnp.arange(M, dtype=jnp.int32)[None, :] - shift) % M
 
@@ -264,3 +265,5 @@ def roll_shard_sparsecore(A_s, shift):  # slower since roll is a nice big DMA lo
 chex.clear_trace_counter()
 chex.assert_trees_all_close(roll_shard_sparsecore(A, shifts), ref)
 roll_shard_sparsecore(A, shifts)
+
+# %%
