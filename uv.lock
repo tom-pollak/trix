@@ -914,6 +914,18 @@ wheels = [
 ]
 
 [[package]]
+name = "libtpu"
+version = "0.0.38"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/34/ee/071e24d098535f1a2268b9c9467b620c54d975edc2515a30c47e7555374c/libtpu-0.0.38-cp312-cp312-manylinux_2_31_x86_64.whl", hash = "sha256:a52597a44ed773562f1033706a15635eba79eeb1972aa0165990b704a4faa28e", size = 213844317, upload-time = "2026-03-19T17:04:02.494Z" },
+    { url = "https://files.pythonhosted.org/packages/81/d2/c4a2f7759145a6efebc8f601a4ffaf8746c48973c2d65ece559131b3206d/libtpu-0.0.38-cp313-cp313-manylinux_2_31_x86_64.whl", hash = "sha256:e427daf6cf94f6fd4cdb7fa4bcf8d77c2b1bba4141fec97737d8921649612d39", size = 213844624, upload-time = "2026-03-19T17:04:34.945Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/32/a8c4aac0804108ec80ef5d09642921406e1c755c99f1136812167c869604/libtpu-0.0.38-cp313-cp313t-manylinux_2_31_x86_64.whl", hash = "sha256:98236e488c9d52a7a8897b032cec6b07a154b9202c1d755c6d8dfe9c925e4dcb", size = 213844960, upload-time = "2026-03-19T17:04:13.32Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/e1/68bcebca6e6190361eec4671a9e4ddab68cb53d8a56b3536a134fe9b4a5d/libtpu-0.0.38-cp314-cp314-manylinux_2_31_x86_64.whl", hash = "sha256:8f308a8b7ed05507b59a221d62b4ec0422e1bf9e9e27f060ee45f6d6b32e1366", size = 213844542, upload-time = "2026-03-19T17:03:50.817Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/fc/e512372c4634d22ba10eaa778437bfe230d9a47fc856d6da5c644724278b/libtpu-0.0.38-cp314-cp314t-manylinux_2_31_x86_64.whl", hash = "sha256:48fd24bdf45156502c908296a30f8bb35d81ee0fafa1e54495f363fcac4d7814", size = 213844853, upload-time = "2026-03-19T17:04:23.949Z" },
+]
+
+[[package]]
 name = "markdown-it-py"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2016,6 +2028,7 @@ dependencies = [
     { name = "equinox" },
     { name = "flax" },
     { name = "jax" },
+    { name = "jaxlib" },
     { name = "jaxtyping" },
     { name = "jupyterlab" },
     { name = "ml-dtypes" },
@@ -2024,12 +2037,17 @@ dependencies = [
     { name = "rich" },
 ]
 
+[package.dev-dependencies]
+tpu = [
+    { name = "libtpu" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "chex", specifier = ">=0.1.91" },
-    { name = "equinox", specifier = ">=0.13.6" },
-    { name = "flax", specifier = ">=0.12.6" },
-    { name = "jax", specifier = ">=0.9.2" },
+    { name = "equinox", specifier = ">=0.13.4" },
+    { name = "jax", specifier = ">=0.9.0.1" },
+    { name = "jaxlib", specifier = ">=0.9.2" },
     { name = "jaxtyping", specifier = ">=0.3.9" },
     { name = "jupyterlab", specifier = ">=4.5.5" },
     { name = "ml-dtypes", specifier = ">=0.5.4" },
@@ -2037,6 +2055,9 @@ requires-dist = [
     { name = "optax", specifier = ">=0.2.7" },
     { name = "rich", specifier = ">=14.3.3" },
 ]
+
+[package.metadata.requires-dev]
+tpu = [{ name = "libtpu", specifier = ">=0.0.38" }]
 
 [[package]]
 name = "typing-extensions"

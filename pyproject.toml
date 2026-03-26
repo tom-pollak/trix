@@ -4,13 +4,18 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "chex>=0.1.91",
-    "equinox>=0.13.6",
-    "flax>=0.12.6",
-    "jax>=0.9.2",
+    "equinox>=0.13.4",
+    "jax>=0.9.0.1",
+    "jaxlib>=0.9.2",
     "jaxtyping>=0.3.9",
     "jupyterlab>=4.5.5",
     "ml-dtypes>=0.5.4",
     "numpy>=2.4.2",
     "optax>=0.2.7",
     "rich>=14.3.3",
+]
+
+[dependency-groups]
+tpu = [
+    "libtpu>=0.0.38",
 ]
