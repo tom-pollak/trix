@@ -9,7 +9,6 @@ from jax.experimental import checkify
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 
-pltpu.CompilerParams()
 INTERPRET = jax.default_backend() == "cpu"
 
 # %%
