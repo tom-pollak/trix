@@ -21,8 +21,25 @@ assert jax.device_count() == 8
 
 # %%
 
-inp = jax.random.uniform(jax.random.key(0), (512, 512))
-inp = jax.device_put(inp, jax.P("x", None))
+inp = jax.random.uniform(jax.random.key(0), (2048, 512))
+inp = jax.device_put(inp, jax.P(None, None))
+
+
+# %%
+@jax.jit
+@partial(
+    jax.shard_map,
+    mesh=mesh,
+    in_specs=jax.P(None, None),
+    out_specs=jax.P(None, None),
+    check_vma=False,
+)
+def ref_reduce_scatter(x):
+    x = jax.lax.psum_scatter(x, "x", scatter_dimension=0, tiled=True)
+    return x
+
+
+out_ref = ref_reduce_scatter(inp)
 
 # %%
 
@@ -48,38 +65,32 @@ def local_barrier(left, right, double_barrier=True):
         )
 
 
-@jax.jit
+@jax.jit(static_argnums=1)
 @partial(
     jax.shard_map,
-    in_specs=jax.P("x", None),
-    out_specs=jax.P("x", None),
+    in_specs=jax.P(None, None),
+    out_specs=jax.P(None, None),
     check_vma=False,
 )
-# @pl.core_map(
-#     mesh=pltpu.create_tensorcore_mesh("core", num_cores=2),
-#     compiler_params=pltpu.CompilerParams(collective_id=0),
-# )
-def reduce_scatter(x_s):
+def reduce_scatter(x_s, reduce_fn=None):
+    device_idx = jax.lax.axis_index("x")
+    num_devices = jax.lax.axis_size("x")
+    M, D = x_s.shape
+
     inner_block = (8, 128)
     assert np.prod(x_s.shape) % (2 * np.prod(inner_block)) == 0, (
         "x must be shape contrained"
     )
 
-    origin_shape = x_s.shape
     x_s_lr = x_s.reshape(2, -1, *inner_block)
-    n_iters = x_s_lr.shape[0]
-
     x_s_lr = jax.new_ref(x_s_lr)
-    partial_x2_lr = jax.new_ref(jnp.empty((2, *x_s_lr.shape), x_s_lr.dtype))
-
-    device_idx = jax.lax.axis_index("x")
-    num_devices = jax.lax.axis_size("x")
+    partial_lr_x2 = jax.new_ref(jnp.empty((2, *x_s_lr.shape), x_s_lr.dtype))
 
     def prologue():
         left = jax.lax.rem(device_idx - 1, num_devices)
         right = jax.lax.rem(device_idx + 1, num_devices)
         local_barrier(left, right)
-        pltpu.sync_copy(x_s_lr, partial_x2_lr.at[0])
+        pltpu.sync_copy(x_s_lr, partial_lr_x2.at[0])
 
     @pl.with_scoped(
         capacity_sem=pltpu.SemaphoreType.REGULAR,
@@ -97,21 +108,21 @@ def reduce_scatter(x_s):
         )  # left=device_id-1, right=device_id+1
 
         x_hbm_slc = x_s_lr.at[left_or_right]
-        partial_x2 = partial_x2_lr.at[:, left_or_right]
+        partial_x2 = partial_lr_x2.at[left_or_right]
 
         # trigger copy into receiving_slot
         pltpu.semaphore_signal(capacity_sem, inc=1, device_id=neighbor_id)
 
-        def local_add(x_vmem, partial_vmem):
+        def default_add(x_vmem, partial_vmem):
             partial_vmem[...] = x_vmem[...]  # should_accumulate_out
 
         inner_spec = pl.BlockSpec(inner_block, lambda i: (i, 0, 0))
         accum_pipeline = pltpu.emit_pipeline(
-            local_add,
-            grid=(n_iters,),
+            reduce_fn or default_add,
+            grid=(num_devices,),
             in_specs=[inner_spec],
             out_specs=inner_spec,
-            should_accumulate_out=True,
+            should_accumulate_out=not reduce_fn,
         )
         accum_pipeline(x_hbm_slc, partial_x2.at[working_slot])
 
@@ -124,18 +135,30 @@ def reduce_scatter(x_s):
             device_id=neighbor_id,
         ).wait()
 
-    # @pl.when(jax.lax.axis_index("core") == 0)
-    @pl.when(True)
+    @pl.core_map(
+        mesh=pltpu.create_tensorcore_mesh("core", num_cores=2),
+        compiler_params=pltpu.CompilerParams(collective_id=0),
+    )
     def main():
-        prologue()
-        pltpu.emit_pipeline(
-            pipeline,
-            grid=(num_devices, 2),
-        )
+        @pl.when(jax.lax.axis_index("core") == 0)
+        def _():
+            prologue()
+            pltpu.emit_pipeline(
+                pipeline,
+                grid=(num_devices, 2),
+            )
 
     final_working_slot = jax.lax.rem(num_devices, 2)
-    return partial_x2_lr.at[final_working_slot].reshape(origin_shape)[...]
+    return (
+        partial_lr_x2.at[:, final_working_slot]
+        .reshape(num_devices, M // num_devices, D)
+        .at[device_idx][...]
+    )
 
 
-out = reduce_scatter(inp)
+print(inp)
+out = reduce_scatter(inp).block_until_ready()
+print(out)
+assert jnp.allclose(out, out_ref)
+
 # %%
