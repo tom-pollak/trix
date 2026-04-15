@@ -366,10 +366,14 @@ xla_result = jax.jit(
     )
 )(input_arr)
 
-print("Input:", input_arr.shape, input_arr[::4, 0])
-print("Pallas Result:", pallas_result.shape, pallas_result[::4, 0])
-print("lax.psum_scatter Result:", xla_result.shape, xla_result[::4, 0])
+# %%
+input_arr_cpu = jax.device_get(input_arr)
+pallas_result_cpu = jax.device_get(pallas_result)
+xla_result_cpu = jax.device_get(xla_result)
+print("Input:", input_arr_cpu.shape, input_arr_cpu[::4, 0])
+print("Pallas Result:", pallas_result_cpu.shape, pallas_result_cpu[::4, 0])
+print("lax.psum_scatter Result:", xla_result_cpu.shape, xla_result_cpu[::4, 0])
 print(
     "Difference |Pallas - lax.psum_scatter|:",
-    jnp.max(jnp.abs(pallas_result - xla_result)),
+    jnp.max(jnp.abs(pallas_result_cpu - xla_result_cpu)),
 )
