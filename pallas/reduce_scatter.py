@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
-from jax.experimental import checkify
 
 if jax.default_backend() == "cpu":
     pltpu.set_tpu_interpret_mode(pltpu.InterpretParams(num_cores_or_threads=2))
@@ -22,7 +21,7 @@ assert jax.device_count() == 8
 # %%
 
 inp = jax.random.uniform(jax.random.key(0), (2048, 512))
-inp = jax.device_put(inp, jax.P(None, None))
+inp = jax.reshard(inp, jax.P(unreduced={"x"}))
 
 
 # %%
@@ -30,8 +29,8 @@ inp = jax.device_put(inp, jax.P(None, None))
 @partial(
     jax.shard_map,
     mesh=mesh,
-    in_specs=jax.P(None, None),
-    out_specs=jax.P(None, None),
+    in_specs=jax.P(unreduced={"x"}),
+    out_specs=jax.P("x"),
     check_vma=False,
 )
 def ref_reduce_scatter(x):
@@ -68,8 +67,8 @@ def local_barrier(left, right, double_barrier=True):
 @jax.jit(static_argnums=1)
 @partial(
     jax.shard_map,
-    in_specs=jax.P(None, None),
-    out_specs=jax.P(None, None),
+    in_specs=jax.P(unreduced={"x"}),
+    out_specs=jax.P("x"),
     check_vma=False,
 )
 def reduce_scatter(x_s, reduce_fn=None):
@@ -82,6 +81,7 @@ def reduce_scatter(x_s, reduce_fn=None):
         "x must be shape contrained"
     )
 
+    n_blocks = M * D // (2 * np.prod(inner_block))
     x_s_lr = x_s.reshape(2, -1, *inner_block)
     x_s_lr = jax.new_ref(x_s_lr)
     partial_lr_x2 = jax.new_ref(jnp.empty((2, *x_s_lr.shape), x_s_lr.dtype))
@@ -119,7 +119,7 @@ def reduce_scatter(x_s, reduce_fn=None):
         inner_spec = pl.BlockSpec(inner_block, lambda i: (i, 0, 0))
         accum_pipeline = pltpu.emit_pipeline(
             reduce_fn or default_add,
-            grid=(num_devices,),
+            grid=(n_blocks,),
             in_specs=[inner_spec],
             out_specs=inner_spec,
             should_accumulate_out=not reduce_fn,
@@ -140,7 +140,7 @@ def reduce_scatter(x_s, reduce_fn=None):
         compiler_params=pltpu.CompilerParams(collective_id=0),
     )
     def main():
-        @pl.when(jax.lax.axis_index("core") == 0)
+        @pltpu.run_on_first_core("core")
         def _():
             prologue()
             pltpu.emit_pipeline(
@@ -148,7 +148,7 @@ def reduce_scatter(x_s, reduce_fn=None):
                 grid=(num_devices, 2),
             )
 
-    final_working_slot = jax.lax.rem(num_devices, 2)
+    final_working_slot = jax.lax.rem(num_devices - 1, 2)
     return (
         partial_lr_x2.at[:, final_working_slot]
         .reshape(num_devices, M // num_devices, D)
