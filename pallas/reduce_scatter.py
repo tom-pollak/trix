@@ -103,7 +103,7 @@ def reduce_scatter(x_s, reduce_fn=None):
         left = jax.lax.rem(device_idx - 1, num_devices)
         right = jax.lax.rem(device_idx + 1, num_devices)
         local_barrier(left, right)
-        pltpu.sync_copy(x_s_lr, partial_lr_x2.at[0])
+        pltpu.sync_copy(x_s_lr, partial_lr_x2.at[:, 0])
 
     @pl.with_scoped(
         capacity_sem=pltpu.SemaphoreType.REGULAR,
