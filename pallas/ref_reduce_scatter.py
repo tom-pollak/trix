@@ -337,26 +337,26 @@ def lax_reduce_sum_scatter(x, block_size):
 outer_block_size = (256, 256)
 # We pick a smaller VMEM block size for the inner kernel.
 inner_block_size = (128, 128)
-input_arr = jax.random.uniform(
+inp = jax.random.uniform(
     jax.random.key(0),
     shape=(
         outer_block_size[0] * num_devices,
         outer_block_size[1] * num_devices,
     ),
 )
-input_arr = jax.device_put(input_arr, jax.P(None, "x"))
+inp = jax.device_put(inp, jax.P(None, "x"))
 
-pallas_result = reduce_scatter(input_arr, outer_block_size, inner_block_size)
+pallas_result = reduce_scatter(inp, outer_block_size, inner_block_size)
 pallas_result = jax.block_until_ready(pallas_result)
 
-xla_result = lax_reduce_sum_scatter(input_arr, outer_block_size)
+xla_result = lax_reduce_sum_scatter(inp, outer_block_size)
 
 # %%
-input_arr_cpu = jax.device_get(input_arr)
+inp_cpu = jax.device_get(inp)
 pallas_result_cpu = jax.device_get(pallas_result)
 xla_result_cpu = jax.device_get(xla_result)
 diff = jnp.max(jnp.abs(pallas_result_cpu - xla_result_cpu))
-print("Input:", input_arr_cpu.shape, input_arr_cpu[::4, 0])
+print("Input:", inp_cpu.shape, inp_cpu[::4, 0])
 print("Pallas Result:", pallas_result_cpu.shape, pallas_result_cpu[::4, 0])
 print("lax.psum_scatter Result:", xla_result_cpu.shape, xla_result_cpu[::4, 0])
 print("Difference |Pallas - lax.psum_scatter|:", diff)

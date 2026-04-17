@@ -1,4 +1,5 @@
 # %%
+from fontTools.unicodedata import block
 import os
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
@@ -25,31 +26,32 @@ if jax.default_backend() == "cpu":
         ChipVersion("7"), get_num_device_cores()
     )
 
-mesh = jax.make_mesh((8,), ("x",), (jax.sharding.AxisType.Explicit,))
+num_devices = jax.device_count()
+mesh = jax.make_mesh((num_devices,), ("x",), (jax.sharding.AxisType.Explicit,))
 jax.set_mesh(mesh)
-assert jax.device_count() == 8
 
 # %%
 
 inp = jax.random.uniform(jax.random.key(0), (2048, 512))
-inp = jax.reshard(inp, jax.P(unreduced={"x"}))
+inp = jax.reshard(inp, jax.P(None, "x"))
 
 
 # %%
-@jax.jit
-@partial(
-    jax.shard_map,
-    mesh=mesh,
-    in_specs=jax.P(unreduced={"x"}),
-    out_specs=jax.P("x"),
-    check_vma=False,
-)
-def ref_reduce_scatter(x):
-    x = jax.lax.psum_scatter(x, "x", scatter_dimension=0, tiled=True)
-    return x
+@jax.jit(static_argnames=["block_size"])
+def lax_reduce_sum_scatter(x, block_size):
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=jax.P(None, "x"),
+        out_specs=jax.P("x", None),
+    )
+    def inner(x):
+        x = x.reshape(num_devices, -1, block_size[0], block_size[1])
+        return jax.lax.psum_scatter(x, "x")
+
+    return inner(x)
 
 
-out_ref = ref_reduce_scatter(inp)
+out_ref = lax_reduce_sum_scatter(inp, block_size=(128, 128))
 
 # %%
 
@@ -78,8 +80,8 @@ def local_barrier(left, right, double_barrier=True):
 @jax.jit(static_argnums=1)
 @partial(
     jax.shard_map,
-    in_specs=jax.P(unreduced={"x"}),
-    out_specs=jax.P("x"),
+    in_specs=jax.P(None, "x"),
+    out_specs=jax.P("x", None),
     check_vma=False,
 )
 def reduce_scatter(x_s, reduce_fn=None):
