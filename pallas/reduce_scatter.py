@@ -132,7 +132,7 @@ def reduce_scatter(x_s, reduce_fn=None):
         inner_spec = pl.BlockSpec(inner_block, lambda i: (i, 0, 0))
         accum_pipeline = pltpu.emit_pipeline(
             reduce_fn or default_add,
-            grid=(n_blocks,),
+            grid=(int(n_blocks),),
             in_specs=[inner_spec],
             out_specs=inner_spec,
             should_accumulate_out=not reduce_fn,
@@ -158,8 +158,8 @@ def reduce_scatter(x_s, reduce_fn=None):
             prologue()
             pltpu.emit_pipeline(
                 pipeline,
-                grid=(num_devices, 2),
-            )
+                grid=(int(num_devices), 2),
+            )()
 
     final_working_slot = jax.lax.rem(num_devices - 1, 2)
     return (
