@@ -9,8 +9,6 @@ from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-P = jax.sharding.PartitionSpec
-
 if jax.default_backend() == "cpu":
     pltpu.set_tpu_interpret_mode(pltpu.InterpretParams(num_cores_or_threads=2))
 
@@ -30,25 +28,8 @@ assert num_devices > 1, "Please run this notebook with more than one device."
 
 print(f"Running with {num_devices} {jax.devices()[0].device_kind} devices.")
 
-partition = P(None, "x")
 mesh = jax.make_mesh((num_devices,), ("x",))
-sharding = jax.sharding.NamedSharding(mesh, partition)
-
-# We pick a large outer kernel block size that we do not want to place
-# in VMEM. For pedagogical purposes we use (4096, 4096), although in
-# principle this can be much larger.
-outer_block_size = (4096, 4096)
-# We pick a smaller VMEM block size for the inner kernel.
-inner_block_size = (128, 128)
-input_arr = jax.random.uniform(
-    jax.random.key(0),
-    shape=(
-        outer_block_size[0] * num_devices,
-        outer_block_size[1] * num_devices,
-    ),
-)
-input_arr = jax.device_put(input_arr, sharding)
-
+jax.set_mesh(mesh)
 
 LEFT = 0
 RIGHT = 1
@@ -106,37 +87,6 @@ def local_barrier(left_neighbor, right_neighbor, double_barrier=True):
             pltpu.semaphore_wait(second_barrier, 2)
 
 
-partition = P(None, "x")
-mesh = jax.make_mesh((num_devices,), ("x",))
-sharding = jax.sharding.NamedSharding(mesh, partition)
-
-# We pick a large outer kernel block size that we do not want to place
-# in VMEM. For pedagogical purposes we use (4096, 4096), although in
-# principle this can be much larger.
-outer_block_size = (4096, 4096)
-# We pick a smaller VMEM block size for the inner kernel.
-inner_block_size = (128, 128)
-input_arr = jax.random.uniform(
-    jax.random.key(0),
-    shape=(
-        outer_block_size[0] * num_devices,
-        outer_block_size[1] * num_devices,
-    ),
-)
-input_arr = jax.device_put(input_arr, sharding)
-
-
-inner_grid = (
-    outer_block_size[0] // inner_block_size[0] // 2,
-    outer_block_size[1] // inner_block_size[1],
-)
-inner_block_spec = pl.BlockSpec(
-    index_map=lambda i, j: (i, j),
-    block_shape=inner_block_size,
-    memory_space=pltpu.VMEM,
-)
-
-
 def reduce_scatter_kernel(
     x_ref,
     o_ref,
@@ -148,6 +98,9 @@ def reduce_scatter_kernel(
     right_send_sem,
     left_capacity_sem,
     right_capacity_sem,
+    *,
+    outer_block_size,
+    inner_block_size,
 ):
     outer_step = pl.program_id(0)
     phase = pl.program_id(1)
@@ -166,6 +119,16 @@ def reduce_scatter_kernel(
     right_copy_slice = pl.ds(outer_block_size[0] // 2, outer_block_size[0] // 2)
     current_phase_slice = pl.ds(
         phase * (outer_block_size[0] // 2), outer_block_size[0] // 2
+    )
+
+    inner_grid = (
+        outer_block_size[0] // inner_block_size[0] // 2,
+        outer_block_size[1] // inner_block_size[1],
+    )
+    inner_block_spec = pl.BlockSpec(
+        index_map=lambda i, j: (i, j),
+        block_shape=inner_block_size,
+        memory_space=pltpu.VMEM,
     )
 
     initial_left_copy = pltpu.make_async_remote_copy(
@@ -302,78 +265,101 @@ def reduce_scatter_kernel(
             pltpu.semaphore_wait(left_capacity_sem, 1)
 
 
-out_shape = (
-    jax.ShapeDtypeStruct((outer_block_size[0], outer_block_size[1]), jnp.float32),
-    # Shape: [working/recv, block[0], block[1]]
-    jax.ShapeDtypeStruct(
-        (2, outer_block_size[0], outer_block_size[1]), jnp.float32
-    ),  # hbm_scratch
-)
-
-grid_spec = pltpu.PrefetchScalarGridSpec(
-    num_scalar_prefetch=0,
-    in_specs=[
-        pl.BlockSpec(memory_space=pl.ANY),
-    ],
-    out_specs=[
-        pl.BlockSpec(memory_space=pl.ANY),
-        pl.BlockSpec(memory_space=pl.ANY),
-    ],
-    grid=(num_devices, 2),
-    scratch_shapes=(
-        [pltpu.SemaphoreType.DMA] * 5
-        + [pltpu.SemaphoreType.REGULAR] * 2  # Capacity semaphores
-    ),
-)
-
-
-def pallas_reduce_scatter(input_arr):
-    input_arr = input_arr.reshape(num_devices, outer_block_size[0], outer_block_size[1])
-    return pl.pallas_call(
-        reduce_scatter_kernel,
-        out_shape=out_shape,
-        grid_spec=grid_spec,
-        compiler_params=pltpu.CompilerParams(collective_id=0),
-    )(input_arr)[0]
-
-
-pallas_result = jax.jit(
-    jax.shard_map(
-        pallas_reduce_scatter,
+@jax.jit(static_argnames=["outer_block_size", "inner_block_size"])
+def reduce_scatter(x, outer_block_size, inner_block_size):
+    @jax.shard_map(
         mesh=mesh,
-        in_specs=P(None, "x"),
-        out_specs=P("x", None),
+        in_specs=jax.P(None, "x"),
+        out_specs=jax.P("x", None),
         check_vma=False,
     )
-)(input_arr)
+    def inner(x_s):
+        x_s = x_s.reshape(num_devices, outer_block_size[0], outer_block_size[1])
+
+        out_shape = (
+            jax.ShapeDtypeStruct(
+                (outer_block_size[0], outer_block_size[1]), jnp.float32
+            ),
+            # Shape: [working/recv, block[0], block[1]]
+            jax.ShapeDtypeStruct(
+                (2, outer_block_size[0], outer_block_size[1]), jnp.float32
+            ),  # hbm_scratch
+        )
+
+        grid_spec = pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=0,
+            in_specs=[
+                pl.BlockSpec(memory_space=pl.ANY),
+            ],
+            out_specs=[
+                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec(memory_space=pl.ANY),
+            ],
+            grid=(num_devices, 2),
+            scratch_shapes=(
+                [pltpu.SemaphoreType.DMA] * 5
+                + [pltpu.SemaphoreType.REGULAR] * 2  # Capacity semaphores
+            ),
+        )
+
+        return pl.pallas_call(
+            functools.partial(
+                reduce_scatter_kernel,
+                outer_block_size=outer_block_size,
+                inner_block_size=inner_block_size,
+            ),
+            out_shape=out_shape,
+            grid_spec=grid_spec,
+            compiler_params=pltpu.CompilerParams(collective_id=0),
+        )(x_s)[0]
+
+    return inner(x)
 
 
-def lax_reduce_sum_scatter(x):
-    x = x.reshape(num_devices, outer_block_size[0], outer_block_size[1])
-    return lax.psum_scatter(x, "x")
+@jax.jit(static_argnames=["block_size"])
+def lax_reduce_sum_scatter(x, block_size):
+    @jax.shard_map(
+        mesh=mesh,
+        in_specs=jax.P(None, "x"),
+        out_specs=jax.P("x", None),
+    )
+    def inner(x):
+        x = x.reshape(num_devices, block_size[0], block_size[1])
+        return lax.psum_scatter(x, "x")
+
+    return inner(x)
 
 
 # %%
+# We pick a large outer kernel block size that we do not want to place
+# in VMEM. For pedagogical purposes we use (4096, 4096), although in
+# principle this can be much larger.
+outer_block_size = (256, 256)
+# We pick a smaller VMEM block size for the inner kernel.
+inner_block_size = (128, 128)
+input_arr = jax.random.uniform(
+    jax.random.key(0),
+    shape=(
+        outer_block_size[0] * num_devices,
+        outer_block_size[1] * num_devices,
+    ),
+)
+input_arr = jax.device_put(input_arr, jax.P(None, "x"))
 
+pallas_result = reduce_scatter(input_arr, outer_block_size, inner_block_size)
 pallas_result = jax.block_until_ready(pallas_result)
 
-xla_result = jax.jit(
-    jax.shard_map(
-        lax_reduce_sum_scatter,
-        mesh=mesh,
-        in_specs=P(None, "x"),
-        out_specs=P("x", None),
-    )
-)(input_arr)
+xla_result = lax_reduce_sum_scatter(input_arr, outer_block_size)
 
 # %%
 input_arr_cpu = jax.device_get(input_arr)
 pallas_result_cpu = jax.device_get(pallas_result)
 xla_result_cpu = jax.device_get(xla_result)
+diff = jnp.max(jnp.abs(pallas_result_cpu - xla_result_cpu))
 print("Input:", input_arr_cpu.shape, input_arr_cpu[::4, 0])
 print("Pallas Result:", pallas_result_cpu.shape, pallas_result_cpu[::4, 0])
 print("lax.psum_scatter Result:", xla_result_cpu.shape, xla_result_cpu[::4, 0])
-print(
-    "Difference |Pallas - lax.psum_scatter|:",
-    jnp.max(jnp.abs(pallas_result_cpu - xla_result_cpu)),
-)
+print("Difference |Pallas - lax.psum_scatter|:", diff)
+assert diff < 1e-4
+
+# %%
