@@ -14,6 +14,17 @@ import jax.experimental.pallas.tpu as pltpu
 if jax.default_backend() == "cpu":
     pltpu.set_tpu_interpret_mode(pltpu.InterpretParams(num_cores_or_threads=2))
 
+    from jax._src.pallas.mosaic.tpu_info import (
+        registry,
+        _get_tpu_info_impl,
+        ChipVersion,
+        get_num_device_cores,
+    )
+
+    registry["cpu"] = lambda: _get_tpu_info_impl(
+        ChipVersion("7"), get_num_device_cores()
+    )
+
 mesh = jax.make_mesh((8,), ("x",), (jax.sharding.AxisType.Explicit,))
 jax.set_mesh(mesh)
 assert jax.device_count() == 8
